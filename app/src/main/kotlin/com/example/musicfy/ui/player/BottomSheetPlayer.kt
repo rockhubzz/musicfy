@@ -1148,12 +1148,100 @@ fun BottomSheetPlayer(
             onDispose { state.collapseOnNestedOverscroll = true }
         }
 
-        if ((showQueue || showLyrics) && state.isExpandedOrExpanding) {
-            // Composed only while a page is open on the expanded player, so it registers after -
-            // and wins over - the sheet's own back handler: back shrinks the page into its card
-            // first, then collapses the player. Not while collapsed: the page is remembered then,
-            // and back belongs to the app.
-            BackHandler { transition.close() }
+        // Single authority for back while the player is open, shared with the outer
+        // handler in MainActivity (composed after navigation, so it beats it). Returns
+        // true when the press was consumed.
+        val handlePlayerBack: () -> Boolean = {
+            if (studio.sheet != null) {
+                studio.sheet = null
+                true
+            } else if (studio.engaged) {
+                studio.back()
+                true
+            } else if (showActionMenu) {
+                showActionMenu = false
+                menuReveal.floatValue = 0f
+                true
+            } else if (showSleepTimer) {
+                showSleepTimer = false
+                true
+            } else if (showSongDetails) {
+                showSongDetails = false
+                true
+            } else if (showPlaybackSpeed) {
+                showPlaybackSpeed = false
+                true
+            } else if (showDeviceOutput) {
+                showDeviceOutput = false
+                true
+            } else if (showExpandMenu) {
+                showExpandMenu = false
+                true
+            } else if (transition.page != PlayerPage.NONE) {
+                transition.close()
+                true
+            } else {
+                false
+            }
+        }
+        // Published for MainActivity's outer back handler. Cleared when this leaves
+        // composition (the other rail/bottom-bar branch, or routes that don't mount the
+        // player), so a stale chain never swallows back. Modals with their own animated
+        // dismiss keep theirs: the outer handler stands down while one is up.
+        val backOwner = remember(state) { Any() }
+        androidx.compose.runtime.SideEffect {
+            state.backHandler = handlePlayerBack
+            state.backOwner = backOwner
+            state.backModalOpen = studio.engaged || studio.sheet != null ||
+                showActionMenu || showSleepTimer || showSongDetails ||
+                showPlaybackSpeed || showDeviceOutput
+        }
+        androidx.compose.runtime.DisposableEffect(state, backOwner) {
+            onDispose {
+                if (state.backOwner === backOwner) {
+                    state.backHandler = null
+                    state.backOwner = null
+                    state.backModalOpen = false
+                }
+            }
+        }
+
+        if (state.isExpandedOrExpanding && !state.isDismissed && !studioEngaged) {
+            // Fallback while the outer handler is unavailable; same chain, then collapse
+            // back to the previous screen.
+            BackHandler {
+                state.logEvent("BACK inner")
+                if (!handlePlayerBack()) state.collapseSoft()
+            }
+        }
+
+        // Visible back affordance at the top left of the open player: same destination
+        // as system back on the plain player (collapse to the previous screen). Hidden
+        // on lyrics/queue pages (they have their own close affordance and header), in
+        // the studio, and until the open has settled, so it never floats over the app
+        // mid-animation. Drawn before the sheets so they cover it while up.
+        val playerBackVisible by remember(state) {
+            derivedStateOf { state.isExpanded || (state.isExpandedOrExpanding && state.progress > 0.9f) }
+        }
+        if (playerBackVisible && !studioEngaged && transition.page == PlayerPage.NONE) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.TopStart,
+            ) {
+                PressScaleActionButton(
+                    icon = R.drawable.arrow_back,
+                    tint = Color.White.copy(alpha = 0.90f),
+                    containerColor = Color.White.copy(alpha = 0.15f),
+                    onClick = {
+                        state.logEvent("BACK button")
+                        if (!handlePlayerBack()) state.collapseSoft()
+                    },
+                    hasShadow = false,
+                    modifier = Modifier
+                        .statusBarsPadding()
+                        .padding(start = 16.dp, top = 8.dp),
+                )
+            }
         }
 
         if (showSleepTimer) {

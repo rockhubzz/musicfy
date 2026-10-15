@@ -15,6 +15,7 @@ import android.os.IBinder
 import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.SharedTransitionLayout
@@ -183,6 +184,7 @@ import com.example.musicfy.ui.component.AppNavigationRail
 import com.example.musicfy.ui.component.LocalBottomSheetPageState
 import com.example.musicfy.ui.component.LocalMenuState
 import com.example.musicfy.ui.component.rememberBottomSheetState
+import com.example.musicfy.ui.component.rememberIsGestureNav
 import com.example.musicfy.ui.component.shimmer.ShimmerTheme
 import com.example.musicfy.ui.menu.YouTubeSongMenu
 import com.example.musicfy.ui.player.BottomSheetPlayer
@@ -677,15 +679,24 @@ class MainActivity : ComponentActivity() {
                 // (a resize it is catching up with), which brought the bar back over the open player.
                 val playerOpen = playerBottomSheetState.isExpanded
                 val playerHeadingDown = !playerBottomSheetState.isExpandedOrExpanding
+                // Gesture nav (Vivo/Funtouch and other OEM skins included) eats the first back
+                // swipe while the navigation bar is hidden, so the bar stays visible there and
+                // the back gesture is always delivered. 3-button nav keeps the old hide +
+                // transient-reveal path, where the back button always works.
+                val isGestureNav = rememberIsGestureNav()
                 // Back in the app (from Home, the recents, a dialog) it's hidden again: with
                 // gesture navigation a swipe from the bottom brings it back for good (see
                 // playerNavBarBehavior).
                 val windowFocused = configuration.isWindowFocused
-                LaunchedEffect(playerOpen, playerHeadingDown, windowFocused) {
+                LaunchedEffect(playerOpen, playerHeadingDown, windowFocused, isGestureNav) {
                     val controller = WindowCompat.getInsetsController(window, window.decorView.rootView)
                     if (playerOpen) {
-                        controller.systemBarsBehavior = window.playerNavBarBehavior()
-                        controller.hide(WindowInsetsCompat.Type.navigationBars())
+                        if (isGestureNav) {
+                            controller.show(WindowInsetsCompat.Type.navigationBars())
+                        } else {
+                            controller.systemBarsBehavior = window.playerNavBarBehavior()
+                            controller.hide(WindowInsetsCompat.Type.navigationBars())
+                        }
                     } else if (playerHeadingDown) {
                         controller.show(WindowInsetsCompat.Type.navigationBars())
                     }
@@ -695,7 +706,7 @@ class MainActivity : ComponentActivity() {
                 @OptIn(ExperimentalLayoutApi::class)
                 val navBarsShown = WindowInsets.areNavigationBarsVisible
                 LaunchedEffect(playerOpen, navBarsShown) {
-                    if (!playerOpen || !navBarsShown) return@LaunchedEffect
+                    if (!playerOpen || !navBarsShown || isGestureNav) return@LaunchedEffect
                     delay(2_500)
                     WindowCompat.getInsetsController(window, window.decorView.rootView)
                         .hide(WindowInsetsCompat.Type.navigationBars())
@@ -1262,6 +1273,23 @@ class MainActivity : ComponentActivity() {
                                     }
                                     }
                                     }
+                                }
+                            }
+                            // Authoritative player back: composed after the NavHost, so it beats
+                            // navigation while the player is open. Everything funnels through the
+                            // chain the player publishes (menu dismiss, page close); modals with
+                            // their own animated dismiss (sheets, studio) keep theirs, and a stale
+                            // chain (player not mounted) disables this entirely.
+                            val playerBackOpen = playerBottomSheetState.isExpandedOrExpanding &&
+                                !playerBottomSheetState.isDismissed
+                            BackHandler(
+                                enabled = playerBackOpen &&
+                                    playerBottomSheetState.backHandler != null &&
+                                    !playerBottomSheetState.backModalOpen,
+                            ) {
+                                playerBottomSheetState.logEvent("BACK outer")
+                                if (playerBottomSheetState.backHandler?.invoke() != true) {
+                                    playerBottomSheetState.collapseSoft()
                                 }
                             }
                         }

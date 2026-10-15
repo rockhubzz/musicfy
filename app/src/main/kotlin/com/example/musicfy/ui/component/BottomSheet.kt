@@ -1,6 +1,7 @@
 // BottomSheet.kt
 
 package com.example.musicfy.ui.component
+import android.os.SystemClock
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationSpec
@@ -33,7 +34,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.systemGestures
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
@@ -66,13 +70,17 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.input.pointer.util.addPointerInputChange
 import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import com.example.musicfy.constants.NavigationBarAnimationSpec
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.math.absoluteValue
 import kotlin.math.pow
 
 private val PlayerSheetAnimationSpec = spring<Dp>(
@@ -543,18 +551,82 @@ class BottomSheetState(
         }
     }
 
+    /**
+     * Timestamped ring buffer for the frozen-sheet investigation (debug readout + COPY LOG).
+     * Plain var on purpose: written from presses, drives and recreations without spamming
+     * recomposition; read only when copying.
+     */
+    var eventLog: String = ""
+
+    fun logEvent(msg: String) {
+        val t = SystemClock.uptimeMillis() % 100000
+        eventLog = "$t $msg\n$eventLog".take(4000)
+    }
+
+    /** True while this state's coroutine scope can still launch sheet animations. */
+    val scopeAlive: Boolean get() = coroutineScope.isActive
+
+    /**
+     * Debug drive tracker (read by the player's debug readout): which call last drove the
+     * sheet animation and toward what, and whether that drive arrived, was cancelled by a
+     * competing animation, or never ran. Decisive for frozen-sheet bugs: anchor flips but
+     * value never moves.
+     */
+    var lastDrive: String by mutableStateOf("none")
+    var lastDriveResult: String by mutableStateOf("-")
+
+    private var driveId = 0L
+
+    private fun drive(tag: String, target: Dp, spec: AnimationSpec<Dp> = spring(), expectedAnchor: Int) {
+        // One press can reach collapseSoft through several enabled back handlers at once
+        // (outer, inner, the sheet's own). Restarting an identical in-flight drive churns
+        // the animation into roughness, so a same-target drive that is already running wins
+        // and the duplicate is dropped. A different target still redirects as before.
+        if (animatable.isRunning && animatable.targetValue == target) {
+            logEvent("drive $tag target=${target.value.toInt()} DEDUPED (already running)")
+            return
+        }
+        val id = ++driveId
+        val startValue = animatable.value
+        lastDrive = "$tag>${target.value.toInt()}"
+        lastDriveResult = "started"
+        logEvent("drive#$id $tag target=${target.value.toInt()} from=${startValue.value.toInt()} anchor=$expectedAnchor")
+        coroutineScope.launch {
+            try {
+                animatable.animateTo(target, spec)
+                if (id == driveId) lastDriveResult = "arrived"
+                logEvent("drive#$id $tag arrived at=${animatable.value.value.toInt()}")
+            } catch (e: CancellationException) {
+                if (id == driveId) lastDriveResult = "cancelled"
+                logEvent("drive#$id $tag CANCELLED at=${animatable.value.value.toInt()}")
+                throw e
+            }
+        }
+        // Watchdog: if the value is byte-for-byte frozen far from target while the anchor
+        // still demands this drive (dropped/cancelled animation the caller never hears
+        // about), snap there. A live drag or a running animation moves value, so only a
+        // truly wedged sheet heals. This is what unfreezes the player on affected phones.
+        coroutineScope.launch {
+            kotlinx.coroutines.delay(600)
+            if (id == driveId && anchor() == expectedAnchor &&
+                (animatable.value - startValue).value.absoluteValue < 0.5f &&
+                (animatable.value - target).value.absoluteValue > 1f
+            ) {
+                animatable.snapTo(target)
+                lastDriveResult = "healed"
+                logEvent("drive#$id WATCHDOG snap to=${target.value.toInt()}")
+            }
+        }
+    }
+
     fun collapse(animationSpec: AnimationSpec<Dp>) {
         onAnchorChanged(collapsedAnchor)
-        coroutineScope.launch {
-            animatable.animateTo(collapsedBound, animationSpec)
-        }
+        drive("collapse", collapsedBound, animationSpec, collapsedAnchor)
     }
 
     fun expand(animationSpec: AnimationSpec<Dp>) {
         onAnchorChanged(expandedAnchor)
-        coroutineScope.launch {
-            animatable.animateTo(animatable.upperBound!!, animationSpec)
-        }
+        drive("expand", animatable.upperBound!!, animationSpec, expandedAnchor)
     }
 
     private fun collapse() {
@@ -575,19 +647,33 @@ class BottomSheetState(
 
     fun dismiss() {
         onAnchorChanged(dismissedAnchor)
-        coroutineScope.launch {
-            animatable.animateTo(animatable.lowerBound!!)
-        }
+        drive("dismiss", animatable.lowerBound!!, expectedAnchor = dismissedAnchor)
     }
 
     suspend fun dismissAndWait() {
         onAnchorChanged(dismissedAnchor)
-        animatable.animateTo(animatable.lowerBound!!)
+        lastDrive = "dismissAndWait>${animatable.lowerBound!!.value.toInt()}"
+        lastDriveResult = "started"
+        try {
+            animatable.animateTo(animatable.lowerBound!!)
+            lastDriveResult = "arrived"
+        } catch (e: CancellationException) {
+            lastDriveResult = "cancelled"
+            throw e
+        }
     }
 
     fun snapTo(value: Dp) {
+        lastDrive = "snapTo>${value.value.toInt()}"
+        lastDriveResult = "started"
         coroutineScope.launch {
-            animatable.snapTo(value)
+            try {
+                animatable.snapTo(value)
+                lastDriveResult = "arrived"
+            } catch (e: CancellationException) {
+                lastDriveResult = "cancelled"
+                throw e
+            }
         }
     }
 
@@ -629,6 +715,20 @@ class BottomSheetState(
      * its queue is open, so pulling down at the top of the queue only stretches the list.
      */
     var collapseOnNestedOverscroll: Boolean = true
+
+    /**
+     * Back chain the player publishes for the outer handler in MainActivity (which is composed
+     * after navigation, so it beats it). Returns true when the press was consumed. Plain vars
+     * would go stale in `enabled`; hence snapshot state. Cleared when the player leaves
+     * composition, so a stale chain never swallows back.
+     */
+    var backHandler: (() -> Boolean)? by mutableStateOf(null)
+
+    /** Which player instance published [backHandler]; guards the clear on dispose. */
+    var backOwner: Any? = null
+
+    /** True while the player holds a modal that owns back with its own animated dismiss. */
+    var backModalOpen: Boolean by mutableStateOf(false)
 
     val preUpPostDownNestedScrollConnection
         get() = object : NestedScrollConnection {
@@ -690,6 +790,24 @@ const val expandedAnchor = 2
 const val collapsedAnchor = 1
 const val dismissedAnchor = 0
 
+/**
+ * True on gesture navigation (any mandatory system-gesture edge inset), false on 3-button nav.
+ *
+ * Reactive snapshot state, unlike a one-shot tappable-element read. The player keeps the system
+ * navigation bar visible on gesture nav: hiding it eats the first back swipe on several OEM
+ * skins (Vivo/Funtouch included), which is exactly "back works on some phones, not others".
+ */
+@Composable
+fun rememberIsGestureNav(): Boolean {
+    val paddings = WindowInsets.systemGestures.asPaddingValues()
+    val layoutDirection = LocalLayoutDirection.current
+    return remember(paddings, layoutDirection) {
+        paddings.calculateLeftPadding(layoutDirection) +
+            paddings.calculateRightPadding(layoutDirection) +
+            paddings.calculateBottomPadding() > 0.dp
+    }
+}
+
 @Composable
 fun rememberBottomSheetState(
     dismissedBound: Dp,
@@ -716,11 +834,8 @@ fun rememberBottomSheetState(
         }
 
         animatable.updateBounds(dismissedBound.coerceAtMost(expandedBound), expandedBound)
-        coroutineScope.launch {
-            animatable.animateTo(initialValue, NavigationBarAnimationSpec)
-        }
 
-        BottomSheetState(
+        val state = BottomSheetState(
             draggableState = DraggableState { delta ->
 
                 coroutineScope.launch(start = CoroutineStart.UNDISPATCHED) {
@@ -734,6 +849,21 @@ fun rememberBottomSheetState(
             collapsePullPx = with(density) { SheetSwipeCommit.toPx() },
             anchor = { previousAnchor },
         )
+        state.lastDrive = "init>${initialValue.value.toInt()}"
+        state.lastDriveResult = "started"
+        state.logEvent("recreate bounds dis=${dismissedBound.value.toInt()} col=${collapsedBound.value.toInt()} exp=${expandedBound.value.toInt()} anchor=$previousAnchor val=${animatable.value.value.toInt()}")
+        coroutineScope.launch {
+            try {
+                animatable.animateTo(initialValue, NavigationBarAnimationSpec)
+                state.lastDriveResult = "arrived"
+                state.logEvent("init arrived at=${animatable.value.value.toInt()}")
+            } catch (e: CancellationException) {
+                state.lastDriveResult = "cancelled"
+                state.logEvent("init CANCELLED at=${animatable.value.value.toInt()}")
+                throw e
+            }
+        }
+        state
     }
 }
 
